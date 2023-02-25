@@ -2705,7 +2705,7 @@ static void mpc_print_unretained(mpc_parser_t *p, int force) {
     if (p->type == MPC_TYPE_ANCHOR) { printf("<@>"); }
     if (p->type == MPC_TYPE_EXPECT) {
         printf("%s", p->data.expect.m);
-        /*mpc_print_unretained(p->data.expect.x, 0);*/
+        /*mpc_print_unretained(p->msg.expect.x, 0);*/
     }
 
     if (p->type == MPC_TYPE_ANY) { printf("<.>"); }

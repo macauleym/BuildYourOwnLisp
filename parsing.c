@@ -38,73 +38,384 @@ void add_history(char* unused) { }
 #define MIN "min"
 #define MAX "max"
 
-// Declare a struct to use as a result.
-typedef struct {
-    union {
-        struct { union { long num; double numd; }; } right;
-        struct { int err;  } left ;
-    };
+/*
+ * Definition and helper methods for the `sval` struct.
+ */
+
+// Declare a struct to use to represent our s-expression.
+typedef struct sval {
     int type;
-} result;
+
+    union {
+        struct { long val; double val_d;} num;
+        struct { char* msg; } err;
+        struct { char* c; } sym;
+    };
+
+    int count;
+    struct sval** cell;
+} sval;
 
 // Enum to give result values names.
-enum RESULT_TYPE { RESULT_RIGHT, RESULT_LEFT };
+enum RESULT_TYPE { SVAL_NUM, SVAL_NUM_D, SVAL_ERR, SVAL_SYM, SVAL_SEXPR };
 
-// Enum to give names to error type values.
-enum RERR_TYPE { RERR_DIV_ZERO, RERR_BAD_OP, RERR_BAD_NUM };
+sval* sval_num(long x) {
+    sval* v    = malloc(sizeof(sval));
+    v->type    = SVAL_NUM;
+    v->num.val = x;
 
-// Functions to construct the valid (right) result
-// and the error (left) result.
-result result_right(long x) {
-    result r;
-    r.type = RESULT_RIGHT;
-    r.right.num  = x;
-
-    return r;
+    return v;
 }
 
-result result_left(int x) {
-    result r;
-    r.type = RESULT_LEFT;
-    r.left.err  = x;
+sval* sval_num_d(double  x) {
+    sval* v      = malloc(sizeof(sval));
+    v->type      = SVAL_NUM_D;
+    v->num.val_d = x;
 
-    return r;
+    return v;
 }
 
-char* build_err_msg(char* msg) {
-    return strcat("ERROR :: ", msg);
+sval* sval_err(char* m) {
+    sval* v     = malloc(sizeof(sval));
+    v->type     = SVAL_ERR;
+    v->err.msg  = malloc(strlen(m) + 1);
+    // strlen does NOT account for the null termination
+    // '\0' character, so we add 1 to account for it.
+
+    strcpy(v->err.msg, m);
+
+    return v;
 }
 
-void result_print(result r) {
-    switch (r.type) {
-        // If we get a valid result num, just print it and break.
-        case RESULT_RIGHT:
-            printf("%li", r.right.num);
+sval* sval_sym(char* s) {
+    sval* v  = malloc(sizeof(sval));
+    v->type  = SVAL_SYM;
+    v->sym.c = malloc(strlen(s) + 1);
+    strcpy(v->sym.c, s);
+
+    return v;
+}
+
+sval* sval_sexpr(void) {
+    sval* v  = malloc(sizeof(sval));
+    v->type  = SVAL_SEXPR;
+    v->count = 0;
+    v->cell  = NULL;
+
+    return v;
+}
+
+void sval_del(sval* s) {
+    switch(s->type) {
+        // We didn't allocate anything in the NUM case.
+        case SVAL_NUM:
+        case SVAL_NUM_D:
+            break;
+
+        // For symbols and errors, free the strings.
+        case SVAL_ERR:
+            free(s->err.msg);
+        break;
+        case SVAL_SYM:
+            free(s->sym.c);
         break;
 
-        // If we get an error, we need to also check what type
-        // of error we got.
-        case RESULT_LEFT:
-            if (r.left.err == RERR_DIV_ZERO) {
-                printf("ERROR :: Division by Zero!");
+        // for S-Expressions, free all the inner elements...
+        case SVAL_SEXPR:
+            for (int i = 0; i < s->count; i++){
+                sval_del(s->cell[i]);
             }
 
-            if (r.left.err == RERR_BAD_OP) {
-                printf("ERROR :: Invalid Operator!");
-            }
+            // Then free the top-level pointers.
+            free(s->cell);
+        break;
+    }
 
-            if (r.left.err == RERR_BAD_NUM) {
-                printf("ERROR :: Invalid Number!");
-            }
+    // Now free the memory for the "sval" struct itself.
+    free(s);
+}
+
+/*
+ * Construct the S-Expr collection from the AST.
+ */
+
+sval* sval_read_num(mpc_ast_t* pTree) {
+    errno = 0;
+    if (strstr(pTree->contents, ".")) {
+        double x = strtod(pTree->contents, NULL);
+
+        return errno != ERANGE
+               ? sval_num_d(x)
+               : sval_err("invalid number");
+    }
+
+    long x = strtol(pTree->contents, NULL, 10);
+
+    return errno != ERANGE
+        ? sval_num(x)
+        : sval_err("invalid number");
+}
+
+sval* sval_append(sval* fst, sval* snd) {
+    fst->count++;
+    fst->cell = realloc(fst->cell, sizeof(sval*) * fst->count);
+    fst->cell[fst->count-1] = snd;
+
+    return fst;
+}
+
+sval* sval_read(mpc_ast_t* pTree) {
+    // If symbol or number, return the conversion
+    // to that type.
+    if (strstr(pTree->tag, "number")) {
+        return sval_read_num(pTree);
+    }
+
+    if (strstr(pTree->tag, "symbol")){
+        return sval_sym(pTree->contents);
+    }
+
+    // If we're at the root (>) or an s-expr then
+    // create an empty list.
+    sval* x = NULL;
+    if (strcmp(pTree->tag, ">") == 0
+    ||  strstr(pTree->tag, "sexpr"))
+    { x = sval_sexpr(); }
+
+    // Fill this new list with any valid expression within.
+    for (int i = 0; i < pTree->children_num; i++) {
+        if (strcmp(pTree->children[i]->contents, "(") == 0
+        ||  strcmp(pTree->children[i]->contents, ")") == 0
+        ||  strcmp(pTree->children[i]->tag, "regex")  == 0)
+        { continue; }
+
+        x = sval_append(x, sval_read(pTree->children[i]));
+    }
+
+    return x;
+}
+
+/*
+ * Functions to evaluate the s-expression structure.
+ */
+
+/*
+ * Pops the sval from the expression tree at the
+ * i'th index. Shifting all other elements, and returning
+ * the value that was popped.
+ */
+sval* sval_pop(sval* v, int i) {
+    // Find the element desired by 'i'.
+    sval* e = v->cell[i];
+
+    // Shift the memory to account for
+    // removal of the element.
+    memmove(&v->cell[i], &v->cell[i+1],
+            sizeof(sval*) * (v->count-i-1));
+
+    // Decrement the count in the list.
+    v->count--;
+
+    // Reallocate the memory used.
+    v->cell = realloc(v->cell, sizeof(sval*) * v->count);
+
+    return e;
+}
+
+/*
+ * Takes a single sval; returning it and deleting
+ * the rest of the collection it's from.
+ */
+sval* sval_take(sval* v, int i) {
+    sval* e = sval_pop(v, i);
+    sval_del(v);
+
+    return e;
+}
+
+double apply_op(char* op, double x, double y, char** hasErr) {
+    // Arithmetic operations.
+    if (strcmp(op, ADD) == 0) { return x + y; }
+    if (strcmp(op, SUB) == 0) { return x - y; }
+    if (strcmp(op, MUL) == 0) { return x * y; }
+    if (strcmp(op, DIV) == 0) {
+        if (y == 0) {
+            *hasErr = "Cannot divide by 0!";
+            return -1;
+        }
+
+        return x / y;
+    }
+    if (strcmp(op, POW) == 0) { return powl(x, y); }
+
+
+    // Builtin functions.
+    if (strcmp(op, MIN) == 0) { return x < y ? x : y; }
+    if (strcmp(op, MAX) == 0) { return x > y ? x : y; }
+
+    *hasErr = "Given an invalid op!";
+    return -1;
+}
+
+long apply_op_l(char* op, long x, long y, char** hasErr) {
+    if (strcmp(op, MOD) == 0) { return x % y; }
+
+    return (long)apply_op(op, x, y, hasErr);
+}
+
+sval* builtin_op(sval* a, char* op) {
+    // Ensure all arguments are numbers.
+    for (int i = 0; i < a-> count; i++) {
+        if (a->cell[i]->type != SVAL_NUM
+        &&  a->cell[i]->type != SVAL_NUM_D){
+            sval_del(a);
+            return sval_err("Expected a number to operate on!");
+        }
+    }
+
+    // Pop the first element to start evaluation.
+    sval* fst = sval_pop(a, 0);
+
+    // If there are no arguments, and we're attempting
+    // a SUB operation, apply unary negation.
+    if (strcmp(op, SUB) == 0 && a->count == 0) {
+        fst->num.val = -fst->num.val;
+    }
+
+    // Work on each element remaining.
+    while (a->count > 0) {
+        // Pop the element to work on it.
+        sval* snd = sval_pop(a, 0);
+
+        char* err = "";
+        if (fst->type == SVAL_NUM_D) {
+            fst->num.val_d = apply_op(op, fst->num.val_d, snd->num.val_d, &err);
+        } else {
+            fst->num.val = apply_op_l(op, fst->num.val, snd->num.val, &err);
+        }
+
+        if (strlen(err) > 0){
+            sval_del(fst);
+            sval_del(snd);
+            fst = sval_err(err);
+
+            break;
+        }
+
+        // Done with the second operand.
+        sval_del(snd);
+    }
+
+    // Done with original expression.
+    sval_del(a);
+
+    return fst;
+}
+
+// Forward declare the s-expression eval function.
+sval* sval_eval_sexpr(sval* v);
+
+sval* sval_eval(sval* v) {
+    // Evaluate the s-expression
+    if (v->type == SVAL_SEXPR) {
+        return sval_eval_sexpr(v);
+    }
+
+    return v;
+}
+
+sval* sval_eval_sexpr(sval* v) {
+    // Evaluate the children.
+    for (int i = 0; i < v->count; i++) {
+        // Had a SEGFAULT here for longer than I'd like to admit.
+        // The function called here should be `sval_eval` and NOT `sval_eval_sexpr`.
+        // When we eval the child element, we need to start at the beginning,
+        // which is first checking if it's an s-expression value.
+        v->cell[i] = sval_eval(v->cell[i]);
+    }
+
+    // Check for errors.
+    for (int i = 0; i < v->count; i++) {
+        if (v->cell[i]->type == SVAL_ERR) {
+            return sval_take(v, i);
+        }
+    }
+
+    // Empty expression.
+    if (v->count == 0) {
+        return v;
+    }
+
+    // Single expression.
+    if (v->count == 1) {
+        return sval_take(v, 0);
+    }
+
+    // Ensure first element is a symbol.
+    sval* fst = sval_pop(v, 0);
+    if (fst->type != SVAL_SYM) {
+        sval_del(fst);
+        sval_del(v);
+
+        return sval_err("S-Expression did not start with a symbol!");
+    }
+
+    // Call the operator function.
+    sval* result = builtin_op(v, fst->sym.c);
+    sval_del(fst);
+
+    return result;
+}
+
+/*
+ * Functions to print out the s-expression structure.
+ */
+
+// Forward declare, since the 2 print
+// functions call each other.
+void sval_print(sval* s);
+
+void sval_expr_print(sval* s, char open, char close) {
+    putchar(open);
+    for (int i = 0; i < s->count; i++) {
+        // Print the value in the cell.
+        sval_print(s->cell[i]);
+
+        // Skip the trailing space if we're on the last element.
+        if (i != (s->count-1)){
+            putchar(' ');
+        }
+    }
+
+    putchar(close);
+}
+
+void sval_print(sval* s) {
+    switch(s->type) {
+        case SVAL_NUM:
+            printf("%li", s->num.val);
+        break;
+        case SVAL_NUM_D:
+            printf("%f", s->num.val_d);
+        break;
+        case SVAL_ERR:
+            printf("ERROR: %s", s->err.msg);
+        break;
+        case SVAL_SYM:
+            printf("%s", s->sym.c);
+        break;
+        case SVAL_SEXPR:
+            sval_expr_print(s, '(', ')');
         break;
     }
 }
 
-void result_println(result r) {
-    result_print(r);
+void sval_println(sval* s) {
+    sval_print(s);
     putchar('\n');
 }
 
+/*
 int number_of_nodes(mpc_ast_t* pTree) {
     // Base case, when there are no children.
     if (pTree->children_num == 0) { return 1; }
@@ -122,116 +433,31 @@ int number_of_nodes(mpc_ast_t* pTree) {
     // Default case.
     return 0;
 }
-
-// Use operator string to see which operation to perform.
-result evaluate_op(result leftOperand, char* op, result rightOperand) {
-    long x = leftOperand.right.num;
-    long y = rightOperand.right.num;
-
-    result opResult = result_left(RERR_BAD_OP);
-
-    // Operators.
-    if (strcmp(op, ADD) == 0) { opResult = result_right(x + y);         }
-    if (strcmp(op, SUB) == 0) { opResult = result_right(x - y);         }
-    if (strcmp(op, MUL) == 0) { opResult = result_right(x * y);         }
-    if (strcmp(op, DIV) == 0) { opResult = y == 0
-                                         ? result_left(RERR_DIV_ZERO)
-                                         : result_right(x / y);         }
-    if (strcmp(op, MOD) == 0) { opResult = result_right(x % y);         }
-    if (strcmp(op, POW) == 0) { opResult = result_right(powl(x, y));    }
-
-
-    // Builtin functions.
-    if (strcmp(op, MIN) == 0) { opResult = result_right(x < y ? x : y); }
-    if (strcmp(op, MAX) == 0) { opResult = result_right(x > y ? x : y); }
-
-    return opResult;
-}
-
-result evaluate_ast(mpc_ast_t* pTree) {
-    // Base case, if tag is 'number' return it.
-    if (strstr(pTree->tag, "number")) {
-        // Check for conversion errors.
-        errno = 0;
-        long num = strtol(pTree->contents, NULL, 10);
-        return errno != ERANGE
-            ? result_right(num)
-            : result_left(RERR_BAD_NUM);
-    }
-
-    if (strstr(pTree->tag, "expr")) {
-        printf("node is an expr!\n");
-    }
-
-    // We've got a parent branch, determine the operator.
-    // We add to the offset if the current contents is a '(' character.
-    // We also ignore the last index for the same reason (but for the ')' character).
-    long next = 0;
-    char* op = "";
-    for (;;) {
-        op = pTree->children[next]->contents;
-        if (strcmp(op, "(") == 0 || strcmp(op, "") == 0) {
-            next++;
-        } else {
-            break;
-        }
-    }
-
-    // Store the next child.
-    result x = evaluate_ast(pTree->children[next+1]);
-
-    // Iterate the remaining children.
-    int i = next+2;
-    int hasOperated = 0;
-    while (strstr(pTree->children[i]->tag, "expr")) {
-        x = evaluate_op(x, op, evaluate_ast(pTree->children[i]));
-        i++;
-        hasOperated = 1;
-    }
-
-    // If we were given a '-' with only 1 argument, negate the argument.
-    if (strcmp(op, SUB) == 0 && hasOperated == 0) {
-        return result_right(-x.right.num);
-    }
-
-    return x;
-}
+*/
 
 int main(int argc, char** argv) {
     // Create the parsers.
-    mpc_parser_t* Number   = mpc_new("number");
-    mpc_parser_t* Operator = mpc_new("operator");
-    mpc_parser_t* Infix    = mpc_new("infix");
-    mpc_parser_t* Builtin  = mpc_new("builtin");
-    mpc_parser_t* Expr     = mpc_new("expr");
-    mpc_parser_t* Lispish  = mpc_new("lispish");
+    mpc_parser_t* Number  = mpc_new("number");
+    mpc_parser_t* Symbol  = mpc_new("symbol");
+    mpc_parser_t* Infix   = mpc_new("infix");
+    mpc_parser_t* Builtin = mpc_new("builtin");
+    mpc_parser_t* Sexpr   = mpc_new("sexpr");
+    mpc_parser_t* Expr    = mpc_new("expr");
+    mpc_parser_t* Lispish = mpc_new("lispish");
 
     // Define them with the following grammar.
     // (\.[0-9]+)?
     mpca_lang(MPCA_LANG_DEFAULT,
-    "                                       \
-       number   : /-?[0-9]+/ ;                       \
-       operator : '+'                                \
-                | '-'                                \
-                | '*'                                \
-                | '/'                                \
-                | '%'                                \
-                | '^' ;                              \
-       infix    : \"add\"                            \
-                | \"sub\"                            \
-                | \"mul\"                            \
-                | \"div\"                            \
-                | \"mod\" ;                          \
-       builtin  : \"min\"                            \
-                | \"max\" ;                          \
-       expr     : <number>                           \
-                | '(' <operator> <expr>+ ')'         \
-                | '(' <builtin> <expr>+ ')' ;        \
-       lispish  : /^/ '(' <operator> <expr>+ ')' /$/ \
-                | /^/ '(' <builtin> <expr>+ ')'/$/   \
-                | /^/ <expr> <infix> <expr>+ /$/ ;   \
+    "                                                          \
+       number   : /-?[0-9]+(\\.[0-9]+)?/ ;                                          \
+       symbol   : '+' | '-' | '*' | '/' | '%' | '^' ;                   \
+       infix    : \"add\" | \"sub\" | \"mul\" | \"div\" | \"mod\" ;     \
+       builtin  : \"min\" | \"max\" ;                                   \
+       sexpr    : '(' <expr>* ')' ;                                     \
+       expr     : <number> | <symbol> | <infix> | <builtin> | <sexpr> ; \
+       lispish  : /^/ <expr>* /$/;                                      \
     ",
-    Number, Operator, Infix, Builtin, Expr, Lispish);
+    Number, Symbol, Infix, Builtin, Sexpr, Expr, Lispish);
 
     // Print out the version info and exit command.
     puts("Lispish Version 0.0.0\n");
@@ -250,14 +476,9 @@ int main(int argc, char** argv) {
             // Success!
             // Load the AST from the output.
             mpc_ast_t* ast = res.output;
-            result evaluated = evaluate_ast(ast);
-            result_println(evaluated);
-
-            // Print the AST (Abstract Syntax Tree).
-            mpc_ast_print(ast);
-
-            // Delete the output.
-            mpc_ast_delete(ast);
+            sval* evaluated = sval_eval(sval_read(ast));
+            sval_println(evaluated);
+            sval_del(evaluated);
         } else {
             // Error! Failed to parse the input.
             mpc_err_print(res.error);
@@ -268,7 +489,7 @@ int main(int argc, char** argv) {
         free(input);
     }
 
-    mpc_cleanup(4, Number, Operator, Expr, Lispish);
+    mpc_cleanup(7, Number, Symbol, Infix, Builtin, Sexpr, Expr, Lispish);
 
     return 0;
 }
